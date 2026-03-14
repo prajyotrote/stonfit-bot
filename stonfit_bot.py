@@ -1,5 +1,8 @@
 import os
+import io
+import base64
 import logging
+import httpx
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
@@ -473,8 +476,51 @@ Max 180 words."""
     return response.content[0].text
 
 
+# ── Image analysis ────────────────────────────────────────────────────────────
+async def analyze_image(image_b64: str, caption: str, exec_id: str) -> str:
+    """Send image + optional caption to Claude vision"""
+
+    # Pick persona based on exec_id or default to jobs for design/UI
+    if exec_id and exec_id in EXECUTIVES:
+        exec_data = EXECUTIVES[exec_id]
+        system = exec_data["system"]
+        prefix_name = f"{exec_data['emoji']} *{exec_data['name']}*"
+    else:
+        # Auto-route image to Jobs (design/UX) unless caption specifies otherwise
+        system = EXECUTIVES["jobs"]["system"]
+        prefix_name = "✦ *Jobs*"
+
+    prompt = caption if caption else "Analyze this image in the context of STON.FIT. Give specific, actionable feedback. Be direct and critical — no softening."
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        system=system,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
+        }]
+    )
+    return prefix_name, response.content[0].text
+
+
 # ── Conversation memory (per user) ───────────────────────────────────────────
 user_history: dict[int, list] = {}
+# Track last exec used per user for image context
+user_last_exec: dict[int, str] = {}
 
 def get_history(user_id: int) -> list:
     return user_history.get(user_id, [])
@@ -483,7 +529,6 @@ def update_history(user_id: int, role: str, content: str):
     if user_id not in user_history:
         user_history[user_id] = []
     user_history[user_id].append({"role": role, "content": content})
-    # Keep last 20 messages only
     user_history[user_id] = user_history[user_id][-20:]
 
 
@@ -513,7 +558,11 @@ Talk to any exec directly:
 *Daily brief:*
 `brief recovery module launch`
 
-Or just type anything — I'll advise as your general CEO counsel.
+*Send any image/screenshot* — add a caption like:
+`jobs review this UI`
+`cmo review this landing page`
+`cto review this architecture diagram`
+Or send with no caption for instant Jobs design review.
 
 Let's build a unicorn. 🦄"""
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -526,11 +575,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Show typing indicator
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     exec_id, question = route_message(text)
     history = get_history(user_id)
+
+    # Track last exec for image context
+    if exec_id not in ("board", "brief", "general"):
+        user_last_exec[user_id] = exec_id
 
     try:
         if exec_id == "board":
@@ -553,7 +605,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         full_response = prefix + response
 
-        # Telegram max message length is 4096
         if len(full_response) > 4000:
             chunks = [full_response[i:i+4000] for i in range(0, len(full_response), 4000)]
             for chunk in chunks:
@@ -561,16 +612,115 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(full_response, parse_mode="Markdown")
 
-        # Update history
         update_history(user_id, "user", text)
         update_history(user_id, "assistant", response)
 
     except Exception as e:
         log.error(f"Error: {e}")
+        await update.message.reply_text("⚠️ Something went wrong. Try again in a moment.")
+
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle image/photo messages with optional caption"""
+    user_id = update.effective_user.id
+    caption = update.message.caption or ""
+
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        # Get highest resolution photo
+        photo = update.message.photo[-1]
+        file = await ctx.bot.get_file(photo.file_id)
+
+        # Download image bytes
+        async with httpx.AsyncClient() as client_http:
+            response = await client_http.get(file.file_path)
+            image_bytes = response.content
+
+        # Convert to base64
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        # Detect exec from caption (e.g. "jobs review this" or "cmo analyse")
+        exec_id = None
+        clean_caption = caption
+        if caption:
+            first_word = caption.lower().split()[0].rstrip(",:") if caption.split() else ""
+            if first_word in ALIASES:
+                exec_id = ALIASES[first_word]
+                clean_caption = caption[len(first_word):].strip().lstrip(",:- ")
+
+        # Default to jobs for design/UI if no exec specified
+        if not exec_id:
+            exec_id = user_last_exec.get(user_id, "jobs")
+
+        await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        prefix_name, analysis = await analyze_image(image_b64, clean_caption, exec_id)
+
+        full_response = f"{prefix_name}\n\n{analysis}"
+
+        if len(full_response) > 4000:
+            chunks = [full_response[i:i+4000] for i in range(0, len(full_response), 4000)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(full_response, parse_mode="Markdown")
+
+        update_history(user_id, "user", f"[Image sent] {caption}")
+        update_history(user_id, "assistant", analysis)
+
+    except Exception as e:
+        log.error(f"Image error: {e}")
+        await update.message.reply_text("⚠️ Couldn't process the image. Try again.")
+
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle documents — PDFs and image files sent as files"""
+    user_id = update.effective_user.id
+    doc = update.message.document
+    caption = update.message.caption or ""
+
+    # Only handle image files sent as documents
+    image_mimes = ["image/jpeg", "image/png", "image/webp", "image/gif"]
+    if doc.mime_type not in image_mimes:
         await update.message.reply_text(
-            "⚠️ Something went wrong. Try again in a moment.",
-            parse_mode="Markdown"
+            "📎 I can read images (JPG, PNG, WEBP). Send the image directly (not as a file) for best results.\n\nPDFs coming soon."
         )
+        return
+
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        file = await ctx.bot.get_file(doc.file_id)
+        async with httpx.AsyncClient() as client_http:
+            response = await client_http.get(file.file_path)
+            image_bytes = response.content
+
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        exec_id = None
+        clean_caption = caption
+        if caption:
+            first_word = caption.lower().split()[0].rstrip(",:") if caption.split() else ""
+            if first_word in ALIASES:
+                exec_id = ALIASES[first_word]
+                clean_caption = caption[len(first_word):].strip().lstrip(",:- ")
+
+        if not exec_id:
+            exec_id = user_last_exec.get(user_id, "jobs")
+
+        prefix_name, analysis = await analyze_image(image_b64, clean_caption, exec_id)
+        full_response = f"{prefix_name}\n\n{analysis}"
+
+        if len(full_response) > 4000:
+            chunks = [full_response[i:i+4000] for i in range(0, len(full_response), 4000)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(full_response, parse_mode="Markdown")
+
+    except Exception as e:
+        log.error(f"Doc error: {e}")
+        await update.message.reply_text("⚠️ Couldn't process the file. Try again.")
 
 
 async def clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -584,6 +734,8 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("STON.FIT Executive OS is live.")
     app.run_polling(drop_pending_updates=True)
